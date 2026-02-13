@@ -3,12 +3,14 @@ import math
 import sys
 import pickle
 import argparse
+import subprocess
 from pathlib import Path
 
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+from matplotlib.widgets import Slider
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.manifold import MDS
 
@@ -64,17 +66,22 @@ MASK_BLUR_KSIZE = 9  # odd number (7,9...) para anti-alias
 MDS_N_INIT = 1
 MODEL_NAME = "buffalo_l"
 DET_SIZE = (640, 640)
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_PATH = os.path.join(PASTA_SAIDA, "face_cache.pkl")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Mapa de similaridade facial")
     parser.add_argument("--images-dir", type=str, default=PASTA_IMAGENS)
+    parser.add_argument("--query-image", type=str, default=None)
+    parser.add_argument("--query-top-k", type=int, default=25)
     parser.add_argument("--face-mode", choices=["all", "largest", "best-score"], default="all")
     parser.add_argument("--min-det-score", type=float, default=0.0)
+    parser.add_argument("--focus-person", type=str, default=None)
+    parser.add_argument("--focus-top-k", type=int, default=30)
     parser.add_argument("--max-edges-per-node", type=int, default=1)
     parser.add_argument("--min-similarity-edge", type=float, default=0.0)
+    parser.add_argument("--hover-min-similarity", type=float, default=0.25)
     parser.add_argument("--only-different-people", action="store_true", default=True)
     parser.add_argument("--person-separator", type=str, default="_")
     parser.add_argument("--no-cache", action="store_true")
@@ -226,6 +233,32 @@ def filter_cached_faces(cached_faces, face_mode: str, min_det_score: float):
     return filtered
 
 
+def abrir_arquivo(path: str):
+    if not path:
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        print("Falha ao abrir arquivo:", path, "|", e)
+
+
+def extrair_face_consulta(app, query_path: str):
+    img = carregar_imagem(query_path)
+    faces = app.get(img)
+    if len(faces) == 0:
+        raise RuntimeError(f"Nenhum rosto encontrado em --query-image: {query_path}")
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    emb = np.asarray(face.embedding, dtype=np.float32)
+    crop_rgb = recortar_quadrado_cover(img, face.bbox, margem=MARGIN, tamanho=CROP_SIZE)
+    crop_rgba = aplicar_mascara_circular_suave(crop_rgb, blur_ksize=MASK_BLUR_KSIZE)
+    return emb, crop_rgba
+
+
 def infer_person_id(filename: str, separator: str) -> str:
     stem = Path(filename).stem
     if separator and separator in stem:
@@ -307,8 +340,16 @@ def get_hover_index(event, pos_norm: np.ndarray, node_half: float):
     return idx if d[idx] <= node_half else None
 
 
-def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, sim: np.ndarray, rostos):
-    state = {"idx": None, "artists": []}
+def habilitar_hover_interativo(
+    fig,
+    ax,
+    pos_norm: np.ndarray,
+    node_half: float,
+    sim: np.ndarray,
+    rostos,
+    min_similarity_hover: float,
+):
+    state = {"idx": None, "artists": [], "min_similarity": float(np.clip(min_similarity_hover, -1.0, 1.0))}
 
     def limpar_artistas():
         for art in state["artists"]:
@@ -320,13 +361,14 @@ def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, 
 
     def desenhar_relacoes(idx: int):
         x0, y0 = pos_norm[idx]
+        indices_ativos = {idx}
         highlight = Circle((x0, y0), radius=node_half * 1.04, fill=False, edgecolor="gold", linewidth=2.0, zorder=8)
         ax.add_patch(highlight)
         state["artists"].append(highlight)
         title = ax.text(
             0.02,
             0.98,
-            f"Rosto: {rostos[idx]['arquivo']} | Pessoa: {rostos[idx]['pessoa']}",
+            f"Similaridade minima (hover): {state['min_similarity']:.2f}",
             transform=ax.transAxes,
             fontsize=10,
             va="top",
@@ -339,6 +381,10 @@ def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, 
         for j in range(sim.shape[0]):
             if j == idx:
                 continue
+            score = float(sim[idx, j])
+            if score < state["min_similarity"]:
+                continue
+            indices_ativos.add(j)
             x1, y1 = pos_norm[j]
             dx, dy = x1 - x0, y1 - y0
             dist = math.hypot(dx, dy)
@@ -350,7 +396,6 @@ def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, 
             ex = x1 - ux * node_half
             ey = y1 - uy * node_half
 
-            score = float(sim[idx, j])
             lw = 0.9 + 3.2 * max(0.0, score)
             line = ax.plot([sx, ex], [sy, ey], linewidth=lw, color=(0.05, 0.05, 0.05, 0.7), zorder=6)[0]
             state["artists"].append(line)
@@ -363,10 +408,24 @@ def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, 
                 fontsize=8,
                 ha="center",
                 va="center",
-                zorder=7,
+                zorder=9,
                 bbox=dict(facecolor="white", alpha=0.75, boxstyle="round,pad=0.08", linewidth=0),
             )
             state["artists"].append(label)
+
+        # Redesenha rostos ligados por cima, para evitar sobreposicao por outros rostos.
+        for k in sorted(indices_ativos):
+            xk, yk = pos_norm[k]
+            left, right = xk - node_half, xk + node_half
+            bottom, top = yk - node_half, yk + node_half
+            img = rostos[k]["image_rgba"]
+            face_overlay = ax.imshow(img, extent=(left, right, bottom, top), interpolation="bilinear", zorder=8)
+            state["artists"].append(face_overlay)
+
+        # Reforca destaque do rosto sob hover no topo.
+        highlight_top = Circle((x0, y0), radius=node_half * 1.06, fill=False, edgecolor="gold", linewidth=2.3, zorder=10)
+        ax.add_patch(highlight_top)
+        state["artists"].append(highlight_top)
 
     def on_move(event):
         if event.inaxes != ax:
@@ -386,7 +445,45 @@ def habilitar_hover_interativo(fig, ax, pos_norm: np.ndarray, node_half: float, 
             desenhar_relacoes(hovered)
         fig.canvas.draw_idle()
 
+    def on_click(event):
+        if event.inaxes != ax:
+            return
+        idx = get_hover_index(event, pos_norm, node_half)
+        if idx is None:
+            return
+        path = rostos[idx].get("path")
+        if path:
+            print("Abrindo arquivo:", path)
+            abrir_arquivo(path)
+
+    def on_slider(_value):
+        if state["idx"] is None:
+            return
+        limpar_artistas()
+        desenhar_relacoes(state["idx"])
+        fig.canvas.draw_idle()
+
     fig.canvas.mpl_connect("motion_notify_event", on_move)
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    # Slider para ajustar limiar de similaridade em tempo real.
+    fig.subplots_adjust(bottom=0.10)
+    ax_slider = fig.add_axes([0.20, 0.03, 0.60, 0.03])
+    slider = Slider(
+        ax=ax_slider,
+        label="Limiar Similaridade",
+        valmin=-1.0,
+        valmax=1.0,
+        valinit=state["min_similarity"],
+        valstep=0.01,
+    )
+    state["slider"] = slider
+
+    def on_slider_changed(value):
+        state["min_similarity"] = float(value)
+        on_slider(value)
+
+    slider.on_changed(on_slider_changed)
 
 
 def inicializar_face_analysis():
@@ -461,21 +558,14 @@ for fn in files:
     if cache is not None:
         entry = cache["images"].get(fn)
         if entry and entry.get("mtime_ns") == mtime_ns and entry.get("file_size") == file_size:
-            faces_data = filter_cached_faces(entry.get("faces", []), args.face_mode, args.min_det_score)
+            faces_data = filter_cached_faces(entry.get("faces_all", []), args.face_mode, args.min_det_score)
             loaded_from_cache = True
 
     if faces_data is None:
-        faces = app.get(img)
-        faces = filter_faces(faces, args.face_mode, args.min_det_score)
-        if len(faces) == 0:
-            print("Nenhum rosto em", fn)
-            if cache is not None:
-                cache["images"][fn] = {"mtime_ns": mtime_ns, "file_size": file_size, "faces": []}
-            continue
-
-        faces_data = []
-        for face in faces:
-            faces_data.append(
+        faces_detected = app.get(img)
+        faces_all_data = []
+        for face in faces_detected:
+            faces_all_data.append(
                 {
                     "bbox": [float(x) for x in face.bbox],
                     "det_score": float(getattr(face, "det_score", 1.0)),
@@ -483,8 +573,15 @@ for fn in files:
                 }
             )
 
+        faces_data = filter_cached_faces(faces_all_data, args.face_mode, args.min_det_score)
+        if len(faces_data) == 0:
+            print("Nenhum rosto em", fn)
+            if cache is not None:
+                cache["images"][fn] = {"mtime_ns": mtime_ns, "file_size": file_size, "faces_all": faces_all_data}
+            continue
+
         if cache is not None:
-            cache["images"][fn] = {"mtime_ns": mtime_ns, "file_size": file_size, "faces": faces_data}
+            cache["images"][fn] = {"mtime_ns": mtime_ns, "file_size": file_size, "faces_all": faces_all_data}
 
     if len(faces_data) == 0:
         print("Nenhum rosto em", fn)
@@ -499,7 +596,7 @@ for fn in files:
         crop_rgb = recortar_quadrado_cover(img, bbox, margem=MARGIN, tamanho=CROP_SIZE)
         crop_rgba = aplicar_mascara_circular_suave(crop_rgb, blur_ksize=MASK_BLUR_KSIZE)
         person_id = infer_person_id(fn, args.person_separator)
-        rostos.append({"arquivo": fn, "pessoa": person_id, "image_rgba": crop_rgba})
+        rostos.append({"arquivo": fn, "pessoa": person_id, "path": path, "image_rgba": crop_rgba})
         embeddings.append(emb)
 
 if cache is not None:
@@ -511,6 +608,73 @@ if n < 2:
     raise SystemExit("Poucos rostos para comparar.")
 
 emb_np = np.vstack(embeddings)
+
+# Foco opcional para reduzir lotacao no grafico:
+# mantém a pessoa alvo + top-k rostos mais similares a ela.
+if args.focus_person:
+    alvo = args.focus_person.strip().lower()
+    idx_focus = [i for i, r in enumerate(rostos) if alvo in r["pessoa"].lower() or alvo in r["arquivo"].lower()]
+    if not idx_focus:
+        raise SystemExit(f"Nenhum rosto encontrado para --focus-person '{args.focus_person}'.")
+
+    focus_emb = emb_np[idx_focus].mean(axis=0, keepdims=True)
+    sim_focus = cosine_similarity(emb_np, focus_emb).ravel()
+    idx_ordenados = np.argsort(sim_focus)[::-1]
+
+    selected = set(idx_focus)
+    for idx in idx_ordenados:
+        selected.add(int(idx))
+        if len(selected) >= len(idx_focus) + max(0, args.focus_top_k):
+            break
+
+    selected_idx = sorted(selected)
+    rostos = [rostos[i] for i in selected_idx]
+    emb_np = emb_np[selected_idx]
+    print(
+        f"Modo foco ativo: '{args.focus_person}' | rostos da pessoa: {len(idx_focus)} | "
+        f"total exibido: {len(selected_idx)}"
+    )
+
+    n = len(rostos)
+    if n < 2:
+        raise SystemExit("Poucos rostos para comparar apos filtro de foco.")
+
+# Busca por rosto de consulta (imagem externa).
+if args.query_image:
+    query_emb, query_rgba = extrair_face_consulta(app, args.query_image)
+    sim_query = cosine_similarity(emb_np, query_emb.reshape(1, -1)).ravel()
+    order = np.argsort(sim_query)[::-1]
+    top_k = max(1, int(args.query_top_k))
+    selected_idx = [int(i) for i in order[:top_k]]
+
+    rostos = [rostos[i] for i in selected_idx]
+    emb_np = emb_np[selected_idx]
+    sim_query = sim_query[selected_idx]
+
+    rostos.insert(
+        0,
+        {
+            "arquivo": f"QUERY: {Path(args.query_image).name}",
+            "pessoa": "query",
+            "path": os.path.abspath(args.query_image),
+            "image_rgba": query_rgba,
+        },
+    )
+    emb_np = np.vstack([query_emb.reshape(1, -1), emb_np])
+
+    out_query = os.path.join(PASTA_SAIDA, "resultado_query.csv")
+    with open(out_query, "w", encoding="utf-8") as f:
+        f.write("rank,arquivo,similaridade\n")
+        for rank, (r, s) in enumerate(zip(rostos[1:], sim_query), start=1):
+            f.write(f"{rank},{r['arquivo']},{float(s):.6f}\n")
+
+    print(f"Busca por imagem ativa: {Path(args.query_image).name} | top_k={top_k}")
+    print("Ranking salvo em:", out_query)
+
+    n = len(rostos)
+    if n < 2:
+        raise SystemExit("Poucos rostos para comparar apos filtro por query.")
+
 sim = cosine_similarity(emb_np)
 dist = 1.0 - sim
 people_ids = [r["pessoa"] for r in rostos]
@@ -596,7 +760,7 @@ print("Mapa salvo em:", out_path)
 
 if args.interactive:
     print("Modo interativo ativo: passe o mouse sobre um rosto para ver as similaridades.")
-    habilitar_hover_interativo(fig, ax, pos_norm, node_half, sim, rostos)
+    habilitar_hover_interativo(fig, ax, pos_norm, node_half, sim, rostos, args.hover_min_similarity)
     plt.show()
 else:
     plt.close(fig)
